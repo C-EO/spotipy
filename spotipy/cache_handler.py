@@ -4,15 +4,17 @@ __all__ = [
     'DjangoSessionCacheHandler',
     'FlaskSessionCacheHandler',
     'MemoryCacheHandler',
-    'RedisCacheHandler']
+    'RedisCacheHandler',
+    'MemcacheCacheHandler']
 
 import errno
 import json
 import logging
 import os
-from spotipy.util import CLIENT_CREDS_ENV_VARS
 
 from redis import RedisError
+
+from spotipy.util import CLIENT_CREDS_ENV_VARS
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +41,6 @@ class CacheHandler():
         Save a token_info dictionary object to the cache and return None.
         """
         raise NotImplementedError()
-        return None
 
 
 class CacheFileHandler(CacheHandler):
@@ -50,15 +51,18 @@ class CacheFileHandler(CacheHandler):
 
     def __init__(self,
                  cache_path=None,
-                 username=None):
+                 username=None,
+                 encoder_cls=None):
         """
         Parameters:
              * cache_path: May be supplied, will otherwise be generated
                            (takes precedence over `username`)
              * username: May be supplied or set as environment variable
                          (will set `cache_path` to `.cache-{username}`)
+             * encoder_cls: May be supplied as a means of overwriting the
+                        default serializer used for writing tokens to disk
         """
-
+        self.encoder_cls = encoder_cls
         if cache_path:
             self.cache_path = cache_path
         else:
@@ -72,27 +76,26 @@ class CacheFileHandler(CacheHandler):
         token_info = None
 
         try:
-            f = open(self.cache_path)
-            token_info_string = f.read()
-            f.close()
+            with open(self.cache_path, encoding='utf-8') as f:
+                token_info_string = f.read()
             token_info = json.loads(token_info_string)
 
-        except IOError as error:
+        except OSError as error:
             if error.errno == errno.ENOENT:
-                logger.debug("cache does not exist at: %s", self.cache_path)
+                logger.debug(f"cache does not exist at: {self.cache_path}")
             else:
-                logger.warning("Couldn't read cache at: %s", self.cache_path)
+                logger.warning(f"Couldn't read cache at: {self.cache_path}")
+        except json.JSONDecodeError:
+            logger.warning(f"Couldn't decode JSON from cache at: {self.cache_path}")
 
         return token_info
 
     def save_token_to_cache(self, token_info):
         try:
-            f = open(self.cache_path, "w")
-            f.write(json.dumps(token_info))
-            f.close()
-        except IOError:
-            logger.warning('Couldn\'t write token to cache at: %s',
-                           self.cache_path)
+            with open(self.cache_path, "w", encoding='utf-8') as f:
+                f.write(json.dumps(token_info, cls=self.encoder_cls))
+        except OSError:
+            logger.warning(f"Couldn't write token to cache at: {self.cache_path}")
 
 
 class MemoryCacheHandler(CacheHandler):
@@ -145,7 +148,7 @@ class DjangoSessionCacheHandler(CacheHandler):
         try:
             self.request.session['token_info'] = token_info
         except Exception as e:
-            logger.warning("Error saving token to cache: " + str(e))
+            logger.warning(f"Error saving token to cache: {e}")
 
 
 class FlaskSessionCacheHandler(CacheHandler):
@@ -170,7 +173,7 @@ class FlaskSessionCacheHandler(CacheHandler):
         try:
             self.session["token_info"] = token_info
         except Exception as e:
-            logger.warning("Error saving token to cache: " + str(e))
+            logger.warning(f"Error saving token to cache: {e}")
 
 
 class RedisCacheHandler(CacheHandler):
@@ -196,7 +199,7 @@ class RedisCacheHandler(CacheHandler):
             if token_info:
                 return json.loads(token_info)
         except RedisError as e:
-            logger.warning('Error getting token from cache: ' + str(e))
+            logger.warning(f"Error getting token from cache: {e}")
 
         return token_info
 
@@ -204,4 +207,36 @@ class RedisCacheHandler(CacheHandler):
         try:
             self.redis.set(self.key, json.dumps(token_info))
         except RedisError as e:
-            logger.warning('Error saving token to cache: ' + str(e))
+            logger.warning(f"Error saving token to cache: {e}")
+
+
+class MemcacheCacheHandler(CacheHandler):
+    """A Cache handler that stores the token info in Memcache using the pymemcache client
+    """
+
+    def __init__(self, memcache, key=None) -> None:
+        """
+        Parameters:
+            * memcache: memcache client object provided by pymemcache
+            (https://pymemcache.readthedocs.io/en/latest/getting_started.html)
+            * key: May be supplied, will otherwise be generated
+                   (takes precedence over `token_info`)
+        """
+        self.memcache = memcache
+        self.key = key if key else 'token_info'
+
+    def get_cached_token(self):
+        from pymemcache import MemcacheError
+        try:
+            token_info = self.memcache.get(self.key)
+            if token_info:
+                return json.loads(token_info.decode())
+        except MemcacheError as e:
+            logger.warning(f"Error getting token to cache: {e}")
+
+    def save_token_to_cache(self, token_info):
+        from pymemcache import MemcacheError
+        try:
+            self.memcache.set(self.key, json.dumps(token_info))
+        except MemcacheError as e:
+            logger.warning(f"Error saving token to cache: {e}")
